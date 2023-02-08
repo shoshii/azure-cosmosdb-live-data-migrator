@@ -1,10 +1,18 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure;
 using Azure.Identity;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.Azure.Cosmos;
 using Migration.Shared;
@@ -22,11 +30,17 @@ namespace Migration.Monitor.WebJob
         private const int SleepTime = 10000;
         private const int MaxConcurrentMonitoringJobs = 5;
 
-        private static readonly Dictionary<string, CosmosClient> sourceClients =
-            new Dictionary<string, CosmosClient>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, CosmosClient> sourceClients =
+            new ConcurrentDictionary<string, CosmosClient>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly Dictionary<string, CosmosClient> destinationClients =
-            new Dictionary<string, CosmosClient>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, CosmosClient> destinationClients =
+            new ConcurrentDictionary<string, CosmosClient>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly ConcurrentDictionary<string, ChangeFeedEstimator> estimators =
+            new ConcurrentDictionary<string, ChangeFeedEstimator>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly ConcurrentDictionary<string, BlobContainerClient> deadletterClients =
+            new ConcurrentDictionary<string, BlobContainerClient>(StringComparer.OrdinalIgnoreCase);
 
 #pragma warning disable IDE0060 // Remove unused parameter
 
@@ -52,9 +66,7 @@ namespace Migration.Monitor.WebJob
 
             try
             {
-                KeyVaultHelper.Initialize(
-                    new Uri(EnvironmentConfig.Singleton.KeyVaultUri),
-                    new DefaultAzureCredential());
+                KeyVaultHelper.Initialize(new DefaultAzureCredential());
 
                 RunAsync().Wait();
             }
@@ -87,6 +99,12 @@ namespace Migration.Monitor.WebJob
                     .CreateContainerIfNotExistsAsync(
                         new ContainerProperties(EnvironmentConfig.Singleton.MigrationMetadataContainerName, "/id"))
                     .ConfigureAwait(false);
+
+                Container leaseContainer = await db
+                    .CreateContainerIfNotExistsAsync(
+                        new ContainerProperties(EnvironmentConfig.Singleton.MigrationLeasesContainerName, "/id"))
+                    .ConfigureAwait(false);
+
 
                 while (true)
                 {
@@ -124,7 +142,27 @@ namespace Migration.Monitor.WebJob
                                     configDocs[i].DestCollectionName,
                                     configDocs[i].Id);
 
-                                await TrackMigrationProgressAsync(container, configDocs[i])
+                                if (!estimators.TryGetValue(configDocs[i].ProcessorName, out ChangeFeedEstimator estimator))
+                                {
+                                    estimator = container.GetChangeFeedEstimator(
+                                        configDocs[i].ProcessorName,
+                                        leaseContainer);
+
+                                    estimators.TryAdd(configDocs[i].ProcessorName, estimator);
+                                }
+
+                                if (!deadletterClients.TryGetValue(
+                                    configDocs[i].ProcessorName,
+                                    out BlobContainerClient deadletterClient))
+                                {
+                                    deadletterClient = KeyVaultHelper.Singleton.GetBlobContainerClientFromKeyVault(
+                                        EnvironmentConfig.Singleton.DeadLetterAccountName,
+                                        configDocs[i].Id?.ToLowerInvariant().Replace("-", String.Empty));
+
+                                    deadletterClients.TryAdd(configDocs[i].ProcessorName, deadletterClient);
+                                }
+
+                                await TrackMigrationProgressAsync(container, estimator, deadletterClient, configDocs[i])
                                     .ConfigureAwait(false);
 
                                 TelemetryHelper.Singleton.LogInfo(
@@ -146,25 +184,153 @@ namespace Migration.Monitor.WebJob
             }
         }
 
-        private static async Task<long> GetDocumentCountAsync(Container container)
+        private static async Task<long> GetPoisonMessageCountAsync(BlobContainerClient deadLetterClient)
+        {
+            TelemetryHelper.Singleton.LogInfo("--> GetPoisonMessageCountAsync {0}", deadLetterClient.Name);
+            try
+            {
+                AsyncPageable<BlobItem> blobsPagable = deadLetterClient.GetBlobsAsync(BlobTraits.All, BlobStates.None);
+                int poisonMessageCount = 0;
+                await foreach (BlobItem blob in blobsPagable.ConfigureAwait(false))
+                {
+                    TelemetryHelper.Singleton.LogInfo("... Blob {0}", blob.Name);
+                    if (blob.Metadata.TryGetValue(
+                        EnvironmentConfig.DeadLetterMetaDataSuccessfulRetryStatusKey,
+                        out string successfulRetryStatusRaw) &&
+                        long.TryParse(successfulRetryStatusRaw, out long successfulRetryStatus) &&
+                        successfulRetryStatus > 0)
+                    {
+                        // all poison messages in this blob have been successfully retried
+                        // safe to ignore
+                        TelemetryHelper.Singleton.LogInfo(
+                            "All poison messages in this blob have been successfully retried safe to ignore - Successful retries {0} - {1}",
+                            successfulRetryStatusRaw,
+                            successfulRetryStatus);
+                        continue;
+                    }
+
+                    TelemetryHelper.Singleton.LogInfo("Before GetBlobClient");
+                    BlobClient blobClient = deadLetterClient.GetBlobClient(blob.Name);
+                    MemoryStream downloadStream = new MemoryStream();
+                    TelemetryHelper.Singleton.LogInfo("Before Download");
+                    Response rsp = await blobClient.DownloadToAsync(downloadStream).ConfigureAwait(false);
+                    TelemetryHelper.Singleton.LogInfo("After Download {0}", rsp.Status);
+                    string blobContent = Encoding.UTF8.GetString(downloadStream.ToArray());
+
+                    int failedDocCount = Regex.Matches(blobContent, EnvironmentConfig.FailedDocSeperator).Count + 1;
+
+                    TelemetryHelper.Singleton.LogInfo(
+                        "FailedDocCount: {0}, Blob: '{1}'",
+                        failedDocCount,
+                        blobContent);
+
+                    if (!blob.Metadata.TryGetValue(
+                        EnvironmentConfig.DeadLetterMetaSuccessfulRetryCountKey,
+                        out string successfulRetryCountRaw) ||
+                        !int.TryParse(successfulRetryCountRaw, out int successfulRetryCount))
+                    {
+                        successfulRetryCount = 0;
+                    }
+
+                    if (successfulRetryCount >= failedDocCount)
+                    {
+                        blob.Metadata[EnvironmentConfig.DeadLetterMetaDataSuccessfulRetryStatusKey] = "1";
+                        Azure.Response<BlobInfo> updateResponse = await blobClient.SetMetadataAsync(
+                            blob.Metadata,
+                            new BlobRequestConditions
+                            {
+                                IfMatch = blob.Properties.ETag
+                            }).ConfigureAwait(false);
+
+                        TelemetryHelper.Singleton.LogInfo(
+                            "Marked SuccessfulRetryStatus for posion message blob '{0}'",
+                            blob.Name);
+                    }
+
+                    Interlocked.Add(ref poisonMessageCount, Math.Max(0, failedDocCount - successfulRetryCount));
+                }
+
+                TelemetryHelper.Singleton.LogInfo("<-- GetPoisonMessageCountAsync {0}", poisonMessageCount);
+                return poisonMessageCount;
+            }
+            catch (Exception error)
+            {
+                TelemetryHelper.Singleton.LogWarning(
+                    "Failed to get number of poison messages. Retrying on next iteration... Exception: {0}",
+                    error);
+
+                TelemetryHelper.Singleton.LogInfo("<-- GetPoisonMessageCountAsync {0}", -1);
+
+                return -1;
+            }
+        }
+
+        private static async Task<long> GetUnprocessedTransactionCountAsync(ChangeFeedEstimator estimator)
+        {
+            try
+            {
+                FeedIterator<ChangeFeedProcessorState> iterator = estimator.GetCurrentStateIterator();
+                List<ChangeFeedProcessorState> states = new List<ChangeFeedProcessorState>();
+                while (iterator.HasMoreResults)
+                {
+                    FeedResponse<ChangeFeedProcessorState> response = await iterator.ReadNextAsync().ConfigureAwait(false);
+                    states.AddRange(response.Resource);
+                }
+
+                return states.Sum(s => s.EstimatedLag);
+            }
+            catch (Exception error)
+            {
+                TelemetryHelper.Singleton.LogWarning(
+                    "Failed to get estimated number of unprocessed documents. Retrying on next iteration... Exception: {0}",
+                    error);
+
+                return -1;
+            }
+        }
+
+        private static Task<long> GetSourceDocumentCountAsync(Container container, MigrationConfig migrationConfig)
+        {
+            return GetDocumentCountAsync(
+                container,
+                migrationConfig,
+                !String.IsNullOrWhiteSpace(migrationConfig.SourcePartitionKeyValueFilter));
+        }
+
+        private static Task<long> GetTargetDocumentCountAsync(
+            Container container,
+            MigrationConfig migrationConfig)
+        {
+            return GetDocumentCountAsync(
+                container,
+                migrationConfig,
+                !String.IsNullOrWhiteSpace(migrationConfig.SourcePartitionKeyValueFilter) &&
+                String.Equals(migrationConfig.SourcePartitionKeys, migrationConfig.TargetPartitionKey));
+        }
+
+        private static async Task<long> GetDocumentCountAsync(
+            Container container,
+            MigrationConfig migrationConfig,
+            bool filterIsPartitionKey)
         {
             if (container == null) { throw new ArgumentNullException(nameof(container)); }
+            if (migrationConfig == null) { throw new ArgumentNullException(nameof(migrationConfig)); }
 
             TelemetryHelper.Singleton.LogInfo(
-                            "Retrieving document count of container '{0}/{1}'",
+                            "Retrieving document count of container '{0}/{1}' with filter '{2}'",
                             container.Database.Id,
-                            container.Id);
+                            container.Id,
+                            migrationConfig.SourcePartitionKeyValueFilter);
 
             try
             {
-                ContainerRequestOptions requestOptions = new ContainerRequestOptions { PopulateQuotaInfo = true };
-                ContainerResponse result = await container.ReadContainerAsync(requestOptions);
-                string usage = result.Headers["x-ms-resource-usage"];
-                string[] quotas = usage.Split(";");
-                const string DocumentsCountPrefix = "documentsCount=";
-
-                long count = long.Parse(
-                    quotas.Single(q => q.StartsWith(DocumentsCountPrefix))[DocumentsCountPrefix.Length..]);
+                long count = String.IsNullOrWhiteSpace(migrationConfig.SourcePartitionKeyValueFilter)
+                    ? await GetDocumentCountEntireContainerAsync(container).ConfigureAwait(false)
+                    : await GetDocumentCountWithFilterAsync(
+                        container,
+                        migrationConfig.SourcePartitionKeys,
+                        migrationConfig.SourcePartitionKeyValueFilter,
+                        filterIsPartitionKey).ConfigureAwait(false);
 
                 TelemetryHelper.Singleton.LogInfo(
                     "Retrieved document count of container '{0}/{1}' - {2}",
@@ -186,11 +352,73 @@ namespace Migration.Monitor.WebJob
             }
         }
 
+        private static async Task<long> GetDocumentCountEntireContainerAsync(Container container)
+        {
+            if (container == null) { throw new ArgumentNullException(nameof(container)); }
+
+            ContainerRequestOptions requestOptions = new ContainerRequestOptions { PopulateQuotaInfo = true };
+            ContainerResponse result = await container.ReadContainerAsync(requestOptions);
+            string usage = result.Headers["x-ms-resource-usage"];
+            string[] quotas = usage.Split(";");
+            const string DocumentsCountPrefix = "documentsCount=";
+
+            return long.Parse(
+                quotas.Single(q => q.StartsWith(DocumentsCountPrefix))[DocumentsCountPrefix.Length..]);
+        }
+
+        private static async Task<long> GetDocumentCountWithFilterAsync(
+            Container container,
+            String sourcePartitionKeyName,
+            String sourcePartitionKeyValue,
+            bool filterIsPartitionKey)
+        {
+            if (container == null) { throw new ArgumentNullException(nameof(container)); }
+            if (String.IsNullOrWhiteSpace(sourcePartitionKeyName)) { throw new ArgumentNullException(nameof(sourcePartitionKeyName)); }
+            if (sourcePartitionKeyValue == null) { throw new ArgumentNullException(nameof(sourcePartitionKeyValue)); }
+
+            QueryDefinition queryDef = new QueryDefinition(
+                String.Format(
+                    CultureInfo.InvariantCulture,
+                    "SELECT VALUE COUNT(1) FROM c WHERE c.{0} = @pkValue",
+                    sourcePartitionKeyName.StartsWith("/") ? 
+                            sourcePartitionKeyName[1..sourcePartitionKeyName.Length] : sourcePartitionKeyName))
+                .WithParameter("@pkValue", sourcePartitionKeyValue);
+
+            QueryRequestOptions requestOptions = new QueryRequestOptions
+            {
+                ConsistencyLevel = ConsistencyLevel.Eventual
+            };
+
+            if (filterIsPartitionKey)
+            {
+                requestOptions.PartitionKey = new PartitionKey(sourcePartitionKeyValue);
+            }
+
+            long recordCount = 0;
+            FeedIterator<long> queryIterator = container.GetItemQueryIterator<long>(queryDef, null, requestOptions);
+            while (queryIterator.HasMoreResults)
+            {
+                FeedResponse<long> pagedResponse = await queryIterator.ReadNextAsync();
+                if (pagedResponse.Resource != null)
+                {
+                    foreach(long current in pagedResponse.Resource)
+                    {
+                        recordCount += current;
+                    }
+                }
+            }
+
+            return recordCount;
+        }
+
         private static async Task TrackMigrationProgressAsync(
             Container migrationContainer,
+            ChangeFeedEstimator estimator,
+            BlobContainerClient deadLetterClient,
             MigrationConfig migrationConfig)
         {
             if (migrationContainer == null) { throw new ArgumentNullException(nameof(migrationContainer)); }
+            if (estimator == null) { throw new ArgumentNullException(nameof(estimator)); }
             if (migrationConfig == null) { throw new ArgumentNullException(nameof(migrationConfig)); }
 
             CosmosClient sourceClient = GetOrCreateSourceCosmosClient(migrationConfig.MonitoredAccount);
@@ -210,9 +438,18 @@ namespace Migration.Monitor.WebJob
 
                 DateTimeOffset now = DateTimeOffset.UtcNow;
 
-                long sourceCollectionCount = await GetDocumentCountAsync(sourceContainer).ConfigureAwait(false);
-                long currentDestinationCollectionCount = await GetDocumentCountAsync(destinationContainer)
-                    .ConfigureAwait(false);
+                Task<long>[] tasks = new Task<long>[4];
+                tasks[0] = GetPoisonMessageCountAsync(deadLetterClient);
+                tasks[1] = GetUnprocessedTransactionCountAsync(estimator);
+                tasks[2] = GetSourceDocumentCountAsync(sourceContainer, migrationConfig);
+                tasks[3] = GetTargetDocumentCountAsync(destinationContainer, migrationConfig);
+
+                long[] results = await Task.WhenAll(tasks).ConfigureAwait(false);
+
+                long poisonMessageCount = results[0];
+                long unprocessedTransactionCount = results[1];
+                long sourceCollectionCount = results[2];
+                long currentDestinationCollectionCount = results[3];
                 double currentPercentage = sourceCollectionCount == 0 ?
                     100 :
                     currentDestinationCollectionCount * 100.0 / sourceCollectionCount;
@@ -242,6 +479,8 @@ namespace Migration.Monitor.WebJob
                 migrationConfigSnapshot.PercentageCompleted = currentPercentage;
                 migrationConfigSnapshot.StatisticsLastUpdatedEpochMs = nowEpochMs;
                 migrationConfigSnapshot.MigratedDocumentCount = currentDestinationCollectionCount;
+                migrationConfigSnapshot.UnprocessedTransactionCountSnapshot = unprocessedTransactionCount;
+                migrationConfigSnapshot.PoisonMessageCountSnapshot = poisonMessageCount;
                 if (insertedCount > 0)
                 {
                     migrationConfigSnapshot.StatisticsLastMigrationActivityRecordedEpochMs = nowEpochMs;
@@ -304,7 +543,7 @@ namespace Migration.Monitor.WebJob
         }
 
         private static CosmosClient GetOrCreateCosmosClient(
-            Dictionary<string, CosmosClient> cache,
+            ConcurrentDictionary<string, CosmosClient> cache,
             string userAgentPrefix,
             string accountName)
         {
@@ -323,7 +562,7 @@ namespace Migration.Monitor.WebJob
                     userAgentPrefix,
                     useBulk: false,
                     retryOn429Forever: true);
-                cache.Add(accountName, client);
+                cache.TryAdd(accountName, client);
 
                 return client;
             }

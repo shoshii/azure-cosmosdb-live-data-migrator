@@ -1,9 +1,14 @@
 ﻿using System;
+using System.Text.RegularExpressions;
 
 namespace Migration.Shared
 {
     public class EnvironmentConfig
     {
+        public const string DeadLetterMetaDataSuccessfulRetryStatusKey = "SuccesfulRetryStatus";
+        public const string DeadLetterMetaSuccessfulRetryCountKey = "SuccesfulRetryCount";
+        public const string FailedDocSeperator = "_(@)_";
+        public const string FailureColumnSeperator = "_-|-_";
         private static EnvironmentConfig singletonInstance;
 
         private readonly Lazy<string> tenantId;

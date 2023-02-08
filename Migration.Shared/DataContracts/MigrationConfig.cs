@@ -9,6 +9,9 @@ namespace Migration.Shared.DataContracts
         [JsonProperty("sourcePartitionKeys")]
         public string SourcePartitionKeys { get; set; }
 
+        [JsonProperty("sourcePartitionKeyValueFilter")]
+        public string SourcePartitionKeyValueFilter { get; set; }
+
         [JsonProperty("targetPartitionKey")]
         public string TargetPartitionKey { get; set; }
 
@@ -45,6 +48,15 @@ namespace Migration.Shared.DataContracts
         [JsonProperty("startTime")]
         public long StartTimeEpochMs { get; set; }
 
+        [JsonProperty("poisonMessageRetryRequestedAt")]
+        public long PoisonMessageRetryRequestedAt { get; set; }
+
+        [JsonProperty("lastPoisonMessageRetryStartedAt")]
+        public long LastPoisonMessageRetryStartedAt { get; set; }
+
+        [JsonProperty("lastPoisonMessageRetryId")]
+        public string LastPoisonMessageRetryId { get; set; }
+
         [JsonProperty("statistics.count")]
         public long MigratedDocumentCount { get; set; }
 
@@ -62,6 +74,12 @@ namespace Migration.Shared.DataContracts
 
         [JsonProperty("statistics.destinationCount")]
         public long DestinationCountSnapshot { get; set; }
+
+        [JsonProperty("statistics.poisonMessageCount")]
+        public long PoisonMessageCountSnapshot { get; set; }
+
+        [JsonProperty("statistics.unprocessedTransactionCount")]
+        public long UnprocessedTransactionCountSnapshot { get; set; }
 
         [JsonProperty("statistics.percentageCompleted")]
         public double PercentageCompleted { get; set; }
@@ -90,7 +108,26 @@ namespace Migration.Shared.DataContracts
 
         // TODO - consider using cleaner Page-View-Model instead
         [JsonIgnore]
-        public string SourceIdentifier => string.Concat(this.MonitoredAccount, "/", this.MonitoredDbName, "/", this.MonitoredCollectionName);
+        public string SourceIdentifier {
+            get {
+                if (String.IsNullOrWhiteSpace(this.SourcePartitionKeyValueFilter))
+                {
+                    return string.Concat(this.MonitoredAccount, "/", this.MonitoredDbName, "/", this.MonitoredCollectionName);
+                }
+
+                return string.Concat(
+                    this.MonitoredAccount,
+                    "/",
+                    this.MonitoredDbName,
+                    "/",
+                    this.MonitoredCollectionName,
+                    "[",
+                    this.SourcePartitionKeys,
+                    "=='",
+                    this.SourcePartitionKeyValueFilter,
+                    "']");
+            }
+        }
 
         [JsonIgnore]
         public string DestinationIdentifier => string.Concat(this.DestAccount, "/", this.DestDbName, "/", this.DestCollectionName);

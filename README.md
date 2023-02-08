@@ -120,7 +120,7 @@ The Cosmos DB Live Data Migrator provides the following features:
 Click the button below:
 
 <br/>
-<a href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fshoshii%2Fazure-cosmosdb-live-data-migrator%2Fmaster%2FMigration.ResourceGroup%2FMigrationServices.json" target="_blank">    <img src="https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/deploytoazure.svg?sanitize=true"/></a>
+<a href="https://raw.githubusercontent.com/shoshii/azure-cosmosdb-live-data-migrator/master/Migration.ResourceGroup/MigrationServices.json" target="_blank">    <img src="https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/deploytoazure.svg?sanitize=true"/></a>
 
 <br/>
 
@@ -165,24 +165,12 @@ Click the button below:
 #### Known issues
 
 - ***IMPORTANT** –it looks like occasionally the ARM template can result in conflicts during the deployment – please attempt a retry (by clicking the Redeploy button and using the same values for the parameters) – this usually works.*
-- ***IMPORTANT** – in a couple of cases the migration-app shows an error “HTTP Error 500.30 - ANCM In-Process Start Failure” after the deployment. In this case it usually helps to toggle the “Runtime stack” (in the Settings/Configuration/General settings section of the <ResourceNamePrefix>-ui App Service resource between .Net and .Net Core (change the value, save and then change it back and save again). This seems to be related to some Windows Images only – will provide an update when this is better understood. But it is only necessary to do this once after finishing the deployment via the ARM template.*
+- ***IMPORTANT** – in a couple of cases the migration-app shows an error “HTTP Error 500.30 - ANCM In-Process Start Failure” after the deployment. In this case it usually helps to toggle the “Runtime stack” (in the Settings/Configuration/General settings section of the <ResourceNamePrefix>-ui App Service resource between .Net and .Net Core (change the value, save and then change it back and save again). This seems to be related to some Windows Images only – will provide an update when this is better understood. But it is only necessary to do this once after finishing the deployment via the ARM template.* This link can also help debugging root cause of this error in case the mitigation above fails: [HTTP Error 500.30 - ANCM In-Process Start Failure - Microsoft Q&A](https://docs.microsoft.com/en-us/answers/questions/38950/http-error-50030-ancm-in-process-start-failure.html)
 
 
 
 #### First migration walk-through
 
-
-- Set the path to wwwroot
-  - navigate the ui service page > Configuration > Path mappings > Virtual applications and directories 
-  - specify the virtual path '/' as 'site\wwwroot\Migration.UI.WebApp'
-
-![readme_13_ui_path.png](images/readme_13_ui_path.png)
-
-- Set the Runtime Stack
-  - navigate the ui service page > Configuration > General settings > Stack settings
-  - specify the Stack as '.NET' and the .NET version as 'ASP.NET V4.8
-
-![readme_14_ui_stack.png](images/readme_14_ui_stack.png)
 
 
 - Open the *-ui resource and click on the URL (it will be of the format: https://resourcenameprefix-ui.azurewebsites.net)
@@ -254,5 +242,103 @@ Click the button below:
 
   - Log Streaming: Logging to the files system has been enabled for all three “App Service” resources. Go to the “Monitoring/Log Stream” section in any of the “App Service” resources to take a look at the real-time logs.
 
+### Building your own installation packages
+- When installing the ARM template the actual application binaries are installed from a publicly available share by default - but theses properties (`migrationAppPackage`, `exectuorWebJobPackage` and `monitorWebJobPackage`) can be overriden.
+- To build these application packages (ZIP files used to deploy to AppServices) follow these steps (the steps are identical for all three apps)
 
+  - Open Powershell terminal in the solution's root folder
 
+  - Create the installation package for the UI application
+
+  ```powershell
+  if (Test-Path $InstallationPackageTargetFolder\Migration.UI.WebApp.zip) {
+    del $InstallationPackageTargetFolder\Migration.UI.WebApp.zip 
+  }
+  if (Test-Path $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp) {
+    del $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp -Recurse
+  }
+  cd Migration.UI.WebApp
+  dotnet clean
+  dotnet publish -c Release
+  cd ..
+  if (-not (Test-Path $InstallationPackageTargetFolder\Temp)) {
+    New-Item -Path $InstallationPackageTargetFolder -Name Temp -ItemType Directory
+  }
+  New-Item -Path $InstallationPackageTargetFolder\Temp -Name Migration.UI.WebApp -ItemType Directory
+  
+  Copy-Item -Path Migration.UI.WebApp\bin\release\netcoreapp3.1\publish\* -Destination $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp -Recurse
+  
+  # NOTE - there is a known issue with MSDeploy related to zip fiels created via the Compress-Archive
+  # cmdlet - as a workaround zip the $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp folder manually please
+  #Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp\* -DestinationPath $InstallationPackageTargetFolder\Migration.UI.WebApp.zip
+  
+  
+  ```
+  
+  - Create the installation package for the Executor WebJob
+  ```powershell
+  if (Test-Path $InstallationPackageTargetFolder\Migration.Executor.WebJob.zip) {
+    del $InstallationPackageTargetFolder\Migration.Executor.WebJob.zip
+  }
+  if (Test-Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob) {
+    del $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob -Recurse
+  }
+  
+  cd Migration.Executor.WebJob
+  dotnet clean
+  dotnet publish -c Release
+  cd ..
+  if (-not (Test-Path $InstallationPackageTargetFolder\Temp)) {
+    New-Item -Path $InstallationPackageTargetFolder -Name Temp -ItemType Directory
+  }
+  New-Item -Path $InstallationPackageTargetFolder\Temp -Name Migration.Executor.WebJob -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob -Name App_Data -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\App_Data -Name jobs -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\App_Data\jobs -Name continuous -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\App_Data\jobs\continuous -Name Migration-Executor-Job -ItemType Directory
+  
+  Copy-Item -Path Migration.Executor.WebJob\bin\release\netcoreapp3.1\publish\* -Destination $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\App_Data\jobs\continuous\Migration-Executor-Job -Recurse
+  
+  # NOTE - there is a known issue with MSDeploy related to zip fiels created via the Compress-Archive
+  # cmdlet - as a workaround zip the $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob folder manually please
+  #Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\* -DestinationPath $InstallationPackageTargetFolder\Migration.Executor.WebJob.zip
+  
+  
+  ```
+  
+  - Create the installation package for the Monitoring WebJob
+  ```powershell
+  if (Test-Path $InstallationPackageTargetFolder\Migration.Monitor.WebJob.zip) {
+    del $InstallationPackageTargetFolder\Migration.Monitor.WebJob.zip
+  }
+  if (Test-Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob) {
+    del $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob -Recurse
+  }
+  
+  cd Migration.Monitor.WebJob
+  dotnet clean
+  dotnet publish -c Release
+  cd ..
+  if (-not (Test-Path $InstallationPackageTargetFolder\Temp)) {
+    New-Item -Path $InstallationPackageTargetFolder -Name Temp -ItemType Directory
+  }
+  New-Item -Path $InstallationPackageTargetFolder\Temp -Name Migration.Monitor.WebJob -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob -Name App_Data -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data -Name jobs -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data\jobs -Name continuous -ItemType Directory
+  New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data\jobs\continuous -Name Migration-Monitor-Job -ItemType Directory
+  
+  Copy-Item -Path Migration.Monitor.WebJob\bin\release\netcoreapp3.1\publish\* -Destination $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data\jobs\continuous\Migration-Monitor-Job -Recurse
+  
+  # NOTE - there is a known issue with MSDeploy related to zip fiels created via the Compress-Archive
+  # cmdlet - as a workaround zip the $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob folder manually please
+  #Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\* -DestinationPath $InstallationPackageTargetFolder\Migration.Monitor.WebJob.zip
+  
+  
+### Deploying updates directly from Dev Machine
+- The easiest way to deploy from my experience is to use the AppService FTP endpoint - here is a good [overview](https://docs.microsoft.com/en-us/azure/app-service/deploy-ftp)
+- Use the scripts above to publish to folders (dotnet clean/dotnet publish) for all three apps
+- Connect via FTP client (for example WinSCP) to the 3 apps (all in the same resource group)
+- For each app copy the output of the bin\debug\netcoreapp3.1\publish folder via the ftp link to the WebApp
+- IMPORTANT - for the UI Web App the right destination folder is just `/site/wwwroot` - for the two Webjobs the destination folder is `/site/wwwroot/App_Data/jobs/continous/Migration-Executor-Job/` or for the Monitor job `/site/wwwroot/App_Data/jobs/continous/Migration-Monitor-Job/`
+- IMPORTANT - when deploying the WebJobs the WebJobs need to be stopped - in the Tab `WebJobs` of the respective AppService resource for the WebJob then stop the Migration/Executor job

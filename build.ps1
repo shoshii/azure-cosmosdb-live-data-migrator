@@ -74,3 +74,7 @@ New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\Ap
 New-Item -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data\jobs\continuous -Name Migration-Monitor-Job -ItemType Directory
 
 Copy-Item -Path Migration.Monitor.WebJob\bin\release\netcoreapp3.1\publish\* -Destination $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\App_Data\jobs\continuous\Migration-Monitor-Job -Recurse
+
+Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.UI.WebApp\* -DestinationPath $InstallationPackageTargetFolder\Migration.UI.WebApp.zip
+Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.Executor.WebJob\* -DestinationPath $InstallationPackageTargetFolder\Migration.Executor.WebJob.zip
+Compress-Archive -Path $InstallationPackageTargetFolder\Temp\Migration.Monitor.WebJob\* -DestinationPath $InstallationPackageTargetFolder\Migration.Monitor.WebJob.zip

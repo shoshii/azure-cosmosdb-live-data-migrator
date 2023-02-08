@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Net;
 using System.Runtime.Serialization.Json;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -10,6 +12,7 @@ using System.Threading.Tasks;
 using System.Xml.Linq;
 using System.Xml.XPath;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.Azure.Cosmos;
 using Migration.Shared;
 using Migration.Shared.DataContracts;
@@ -203,37 +206,19 @@ namespace Migration.Executor.WebJob
         {
             try
             {
-                Boolean isSyntheticKey = this.SourcePartitionKeys.Contains(",");
-                Boolean isNestedAttribute = this.SourcePartitionKeys.Contains("/");
-                Container targetContainer = this.destinationCollectionClient.GetContainer(this.config.DestDbName, this.config.DestCollectionName);
-                this.containerToStoreDocuments = targetContainer;
-                DocumentMetadata document;
-                BulkOperations<DocumentMetadata> bulkOperations = new BulkOperations<DocumentMetadata>(docs.Count);
-                foreach (DocumentMetadata doc in docs)
+                BulkOperationResponse<DocumentMetadata> bulkOperationResponse = await this
+                    .ProcessChangesCoreAsync(docs, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (bulkOperationResponse != null)
                 {
-                    document = (this.SourcePartitionKeys != null & this.TargetPartitionKey != null) ?
-                        MapPartitionKey(doc, isSyntheticKey, this.TargetPartitionKey, isNestedAttribute, this.SourcePartitionKeys) :
-                        document = doc;
-                    if (this.config.OnlyInsertMissingItems)
+                    if (bulkOperationResponse.Failures.Count > 0 && this.deadletterClient != null)
                     {
-                        bulkOperations.Tasks.Add(this.containerToStoreDocuments.CreateItemAsync(
-                            item: document,
-                            cancellationToken: cancellationToken).CaptureOperationResponse(document, ignoreConflicts: true));
+                        await this.WriteFailedDocsToBlob("FailedImportDocs", this.deadletterClient, bulkOperationResponse)
+                            .ConfigureAwait(false);
                     }
-                    else
-                    {
-                        bulkOperations.Tasks.Add(this.containerToStoreDocuments.UpsertItemAsync(
-                            item: document,
-                            cancellationToken: cancellationToken).CaptureOperationResponse(document, ignoreConflicts: true));
-                    }
+                    TelemetryHelper.Singleton.LogMetrics(bulkOperationResponse);
                 }
-                BulkOperationResponse<DocumentMetadata> bulkOperationResponse = await bulkOperations.ExecuteAsync().ConfigureAwait(false);
-                if (bulkOperationResponse.Failures.Count > 0 && this.deadletterClient != null)
-                {
-                    await this.WriteFailedDocsToBlob("FailedImportDocs", this.deadletterClient, bulkOperationResponse)
-                        .ConfigureAwait(false);
-                }
-                TelemetryHelper.Singleton.LogMetrics(bulkOperationResponse);
             }
             catch (Exception error)
             {
@@ -244,6 +229,134 @@ namespace Migration.Executor.WebJob
 
                 throw;
             }
+        }
+
+        private async Task<BulkOperationResponse<DocumentMetadata>> ProcessChangesCoreAsync(
+            IReadOnlyCollection<DocumentMetadata> docs,
+            CancellationToken cancellationToken)
+        {
+
+            Boolean isSyntheticKey = this.SourcePartitionKeys.Contains(",");
+            Boolean isNestedAttribute = this.SourcePartitionKeys.Contains("/");
+            Container targetContainer = this.destinationCollectionClient.GetContainer(this.config.DestDbName, this.config.DestCollectionName);
+            this.containerToStoreDocuments = targetContainer;
+            DocumentMetadata document;
+            BulkOperations<DocumentMetadata> bulkOperations = new BulkOperations<DocumentMetadata>(docs.Count);
+            foreach (DocumentMetadata doc in docs)
+            {
+                if (!String.IsNullOrWhiteSpace(this.config.SourcePartitionKeyValueFilter) &&
+                    !this.config.SourcePartitionKeyValueFilter.Equals(
+                        doc.GetPropertyValue<String>(this.config.SourcePartitionKeys),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                document = (this.SourcePartitionKeys != null & this.TargetPartitionKey != null) ?
+                    MapPartitionKey(doc, isSyntheticKey, this.TargetPartitionKey, isNestedAttribute, this.SourcePartitionKeys) :
+                    document = doc;
+                if (this.config.OnlyInsertMissingItems)
+                {
+                    bulkOperations.Tasks.Add(this.containerToStoreDocuments.CreateItemAsync(
+                        item: document,
+                        cancellationToken: cancellationToken).CaptureOperationResponse(document, ignoreConflicts: true));
+                }
+                else
+                {
+                    bulkOperations.Tasks.Add(this.containerToStoreDocuments.UpsertItemAsync(
+                        item: document,
+                        cancellationToken: cancellationToken).CaptureOperationResponse(document, ignoreConflicts: false));
+                }
+            }
+
+            if (bulkOperations.Tasks.Count > 0)
+            {
+                return await bulkOperations.ExecuteAsync().ConfigureAwait(false);
+            }
+
+            return null;
+        }
+
+        public async Task<int> RetryDocumentMigrations(IEnumerable<DocumentIdentifier> failedDocIdentities)
+        {
+            Container sourceContainer = this.sourceCollectionClient.GetContainer(
+                this.config.MonitoredDbName,
+                this.config.MonitoredCollectionName);
+
+            int successfulRetries = 0;
+
+            try
+            {
+                List<DocumentMetadata> toBeMigratedDocs = new List<DocumentMetadata>();
+                foreach (DocumentIdentifier failedDocIdentity in failedDocIdentities)
+                {
+                    DocumentMetadata sourceDoc;
+                    try
+                    {
+                        sourceDoc = await sourceContainer
+                            .ReadItemAsync<DocumentMetadata>(
+                                failedDocIdentity.Id,
+                                new PartitionKey(failedDocIdentity.PartitionKey))
+                            .ConfigureAwait(false);
+
+                    }
+                    catch (CosmosException notFound) when (notFound.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        TelemetryHelper.Singleton.LogInfo(
+                            "Source document '{0}' doesn't exist anymore",
+                            failedDocIdentity.ToString());
+                        // source document doesn't exist anymore - no need to worry about migration
+                        successfulRetries++;
+                        continue;
+                    }
+
+                    if (sourceDoc.ETag != failedDocIdentity.Etag)
+                    {
+                        TelemetryHelper.Singleton.LogInfo(
+                            "Document '{0}' has changed since the posion message was created - Original Etag '{1}' Etag now '{2}'",
+                            failedDocIdentity.ToString(),
+                            failedDocIdentity.Etag,
+                            sourceDoc.ETag);
+                        // Document has changed since the posion message was created
+                        // no need to worry about migration - the update in the source will
+                        // be handled via separate change feed event
+                        successfulRetries++;
+                        continue;
+                    }
+
+                    toBeMigratedDocs.Add(sourceDoc);
+                }
+
+                if (toBeMigratedDocs.Count > 0)
+                {
+                    try
+                    {
+                        BulkOperationResponse<DocumentMetadata> bulkOperationResponse = await this
+                            .ProcessChangesCoreAsync(toBeMigratedDocs, CancellationToken.None)
+                            .ConfigureAwait(false);
+
+                        successfulRetries += toBeMigratedDocs.Count - bulkOperationResponse.FailedDocs.Count;
+
+                        TelemetryHelper.Singleton.LogMetrics(bulkOperationResponse);
+                    }
+                    catch (Exception error)
+                    {
+                        TelemetryHelper.Singleton.LogError(
+                            "Processing changes in change feed processor {0} failed: {1}",
+                            this.processorName,
+                            error);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                TelemetryHelper.Singleton.LogError(
+                    "Retrying document migration failed. Documents: {0}, Error: {1}",
+                    String.Join(", ", failedDocIdentities.Select(d => d.ToString())),
+                    error);
+            }
+
+            return successfulRetries;
         }
 
         private async Task WriteFailedDocsToBlob(
@@ -259,9 +372,17 @@ namespace Migration.Executor.WebJob
                 BlobClient blobClient = containerClient.GetBlobClient(failureType + Guid.NewGuid().ToString() + ".csv");
 
                 failures = JsonConvert.SerializeObject(String.Join(",", bulkOperationResponse.DocFailures));
-                failedDocs = JsonConvert.SerializeObject(String.Join(",", bulkOperationResponse.FailedDocs));
+                failedDocs = JsonConvert.SerializeObject(
+                    String.Join(
+                        EnvironmentConfig.FailedDocSeperator,
+                        bulkOperationResponse.FailedDocs.Select(deadletterClient => deadletterClient.ToDocumentIdentity(this.config).ToString())));
                 failedDocs = failedDocLineFeedRemoverRegex.Replace(failedDocs, String.Empty);
-                byteArray = Encoding.ASCII.GetBytes(failures + "|" + bulkOperationResponse.Failures.Count + "|" + failedDocs);
+                byteArray = Encoding.UTF8.GetBytes(
+                    String.Join(
+                        EnvironmentConfig.FailureColumnSeperator,
+                        failures,
+                        bulkOperationResponse.Failures.Count.ToString(CultureInfo.InvariantCulture),
+                        failedDocs));
 
                 using (MemoryStream ms = new MemoryStream(byteArray))
                 {
