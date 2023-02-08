@@ -172,6 +172,18 @@ Click the button below:
 #### First migration walk-through
 
 
+- Set the path to wwwroot
+  - navigate the ui service page > Configuration > Path mappings > Virtual applications and directories 
+  - specify the virtual path '/' as 'site\wwwroot\Migration.UI.WebApp'
+
+![readme_13_ui_path.png](images/readme_13_ui_path.png)
+
+- Set the Runtime Stack
+  - navigate the ui service page > Configuration > General settings > Stack settings
+  - specify the Stack as '.NET' and the .NET version as 'ASP.NET V4.8
+
+![readme_14_ui_stack.png](images/readme_14_ui_stack.png)
+
 
 - Open the *-ui resource and click on the URL (it will be of the format: https://resourcenameprefix-ui.azurewebsites.net)
 
